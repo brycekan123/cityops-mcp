@@ -1,0 +1,4 @@
+ollama
+langgraph
+fastmcp
+requests

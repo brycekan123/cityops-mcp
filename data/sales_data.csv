@@ -1,0 +1,9 @@
+customer_id,external_spend,campaign,region
+1,4500.00,email,AMER
+2,1200.00,social,EMEA
+3,800.00,email,AMER
+5,3200.00,search,EMEA
+7,950.00,social,APAC
+8,2100.00,search,APAC
+10,5800.00,email,AMER
+4,1750.00,social,APAC
