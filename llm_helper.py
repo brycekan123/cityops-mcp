@@ -3,11 +3,13 @@ import re
 
 import ollama
 
-MODEL = os.getenv("OLLAMA_MODEL", "llama3.1")
+MODEL        = os.getenv("OLLAMA_MODEL", "llama3.1")
+_OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
+_client      = ollama.Client(host=_OLLAMA_HOST)
 
 
 def llm(system: str, user: str, json_mode: bool = False) -> str:
-    response = ollama.chat(
+    response = _client.chat(
         model=MODEL,
         messages=[
             {"role": "system", "content": system},

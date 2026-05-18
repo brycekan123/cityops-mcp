@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+cityops.sqlite
+.DS_Store
+.claude/
+*.md
+benchmark.py
+docs/

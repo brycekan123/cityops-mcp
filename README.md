@@ -27,8 +27,6 @@ pip install -r requirements.txt
 python chatbot.py
 ```
 
-That's it. The MCP server, SQLite database, and LangGraph agent all start automatically.
-
 **Supported cities:** Atlanta, Chicago, New York, Los Angeles, Houston, Seattle, Miami, Denver
 
 **Change the model** (optional):
@@ -38,182 +36,126 @@ OLLAMA_MODEL=llama3.2 python chatbot.py
 
 ---
 
-## Architecture
+## Running with Docker
 
-Five files do all the work:
+Docker guarantees the MCP subprocess (`city_data_server.py`, spawned via stdio) runs in exactly the right environment regardless of local Python setup.
 
-| File | Role |
-|---|---|
-| `chatbot.py` | CLI loop — takes input, calls agent, prints answer |
-| `agent.py` | LangGraph graph — orchestrates the full pipeline |
-| `city_data_server.py` | MCP server — fetches weather and exposes data tools |
-| `database.py` | SQLite helpers — schema, sampling, querying |
-| `llm_helper.py` | Ollama wrapper — single `llm()` call used everywhere |
+**First time only** — pull the model into the Ollama container:
+```bash
+docker compose up ollama -d
+docker compose exec ollama ollama pull llama3.1
+```
+
+**Start everything:**
+```bash
+docker compose up --build
+docker compose exec chatbot python chatbot.py
+```
+
+**Environment variables** (copy `.env.example` → `.env` to override defaults):
+
+| Variable | Default | Description |
+|---|---|---|
+| `OLLAMA_MODEL` | `llama3.1` | Any model pulled into Ollama |
+| `OLLAMA_HOST` | `http://localhost:11434` | Set automatically to `http://ollama:11434` in Compose |
+
+CSV files in `./data/` are mounted into the container so local files are accessible via `load_csv`.
 
 ---
 
-## Step-by-Step Agentic Workflow
+## Architecture
 
-Every query passes through six nodes in a LangGraph state machine. Here's exactly what happens at each step.
+| File | Role |
+|---|---|
+| `chatbot.py` | CLI loop — takes input, calls agent, prints answer + MCP metrics |
+| `agent.py` | LangGraph graph — orchestrates the full pipeline |
+| `city_data_server.py` | MCP server — Tools, Resources, Prompts, Middleware |
+| `mcp_client.py` | Sync MCP client — persistent connection, caching, session metrics |
+| `database.py` | SQLite helpers — schema, sampling, querying |
+| `llm_helper.py` | Ollama wrapper — single `llm()` call used everywhere |
+| `benchmark.py` | Automated MCP benchmark — cache impact, error demo, primitives discovery |
+
+### MCP Protocol Coverage
+
+This project demonstrates all three MCP primitives:
+
+| Primitive | Implementation | Purpose |
+|---|---|---|
+| **Tools** | `plan_data_load`, `check_coverage`, `load_weather`, `load_csv` | Data fetching and routing decisions |
+| **Resources** | `weather://schema`, `weather://tables` | Live DB schema and table inventory |
+| **Prompts** | `extreme_value_query`, `trend_overview_query`, `specific_date_query`, `comparison_query`, `aggregation_query` | Server-managed SQL scaffolds injected into the actor before SQL generation |
+
+The client layer adds:
+- **Persistent connection** — MCP server subprocess spawns once per session (~750ms saved per subsequent call)
+- **Per-tool and per-resource caching** with smart invalidation (location-scoped for `load_weather`, full clear for `load_csv`, prompts never invalidated)
+- **SessionMetrics** — p50/p95 latency, cache hit rate, time saved, error rate, retry success rate
+
+The server adds:
+- **Middleware** — `ErrorHandlingMiddleware` wraps every tool call; unhandled exceptions (bad city name, API timeout) return `{"error": "..."}` instead of crashing the enricher
+
+---
+
+## Running the Benchmark
+
+`benchmark.py` demonstrates the full MCP protocol in isolation — no LLM required:
+
+```bash
+python benchmark.py
+```
+
+It clears the database, then runs 5 semantically different questions about the same dataset (Atlanta summer, Chicago forecast). This shows real cache acceleration: Q1 pays the full load cost, Q2–Q3 hit `check_coverage` and `weather://schema` from cache. It also discovers and fetches all three MCP primitives (Tools, Resources, Prompts) and runs an error injection demo showing `ErrorHandlingMiddleware` catching a bad city name and returning a structured dict instead of a crash.
+
+---
+
+## Agentic Workflow
+
+Every query passes through six nodes in a LangGraph state machine.
 
 ```
 User query
     │
     ▼
 ┌─────────┐
-│ PLANNER │  LLM decides SQL intent and which tables to use
+│ PLANNER │  LLM parses intent and identifies which tables to query
 └────┬────┘
      │
      ▼
-┌──────────┐
-│ ENRICHER │  MCP fetches weather data if not already in DB
-└────┬─────┘
-     │
-     ▼
-┌────────┐
-│ SCHEMA │  Refreshes schema snapshot after any new data load
-└───┬────┘
-    │
-    ▼
-┌───────┐
-│ ACTOR │  LLM writes and runs the SQL query
+┌──────────┐ ◄─────────────────────────────────────┐
+│ ENRICHER │  MCP: plan → coverage check → load     │ (reload: missing date range)
+└────┬─────┘                                        │
+     │                                              │
+     ▼                                              │
+┌────────┐                                          │
+│ SCHEMA │  MCP: weather://schema + SQL Prompt       │
+└───┬────┘                                          │
+    │                                               │
+    ▼                                               │
+┌───────┐ ◄──────────────────┐                     │
+│ ACTOR │  LLM writes SQL     │ (retry, up to 5x)  │
+└───┬───┘                    │                     │
+    │                        │                     │
+    ▼                        │                     │
+┌───────┐  fail (bad SQL) ───┘                     │
+│ JUDGE │  fail (missing data) ────────────────────┘
 └───┬───┘
-    │
-    ▼
-┌───────┐        ┌──────────┐
-│ JUDGE │──fail──► ENRICHER │  (reload path — see below)
-└───┬───┘        └──────────┘
     │ pass
     ▼
 ┌──────────────┐
-│ FINAL ANSWER │  LLM synthesizes data rows into plain English
+│ FINAL ANSWER │  LLM synthesizes rows into plain English
 └──────────────┘
 ```
 
----
+**Planner** — Outputs a JSON plan: intent, tables, and strategy. Does not decide what data to load.
 
-### 1. Planner
+**Enricher** — Calls `plan_data_load` to parse the query into a fetch request, `check_coverage` to check if the date range is already in SQLite, and `load_weather` only if data is missing.
 
-The planner is the first LLM call. It receives the user's query and the list of available tables and outputs a compact JSON plan:
+**Schema** — Reads the `weather://schema` MCP Resource and fetches a matching MCP Prompt scaffold (one of five SQL templates keyed by query intent: extreme value, overview, specific date, comparison, aggregation). Both are injected into the actor.
 
-```json
-{
-  "intent":        "find the hottest day last summer in Chicago",
-  "analysis_goal": "return the date with the highest temp_max",
-  "tables":        ["weather_daily"],
-  "strategy":      "SELECT date, temp_max ORDER BY temp_max DESC LIMIT 1"
-}
-```
+**Actor** — Receives schema, sample rows filtered to the loaded city, the plan, a deterministic intent hint, and any prior failed attempts with error messages. Outputs raw SQL, immediately executed against SQLite.
 
-The planner's only job is **SQL semantics** — what the user wants and which tables to query. It does not decide what data to load; that responsibility belongs entirely to the MCP enricher.
+**Judge** — First runs deterministic checks (syntax error → fail, zero rows → fail). If rows returned, a lightweight LLM call checks semantic correctness: wrong aggregation type, result for the wrong entity, or wrong table. Confidence ≥ 0.85 to pass. On fail: routes back to the actor (up to 5 retries) or back to the enricher if the SQL asked for a date range not yet in the DB.
 
----
-
-### 2. Enricher (MCP)
-
-The enricher is where the Model Context Protocol comes in. Before the agent can write SQL, it needs the right data in the database.
-
-**Step 1 — Plan the load**
-
-The enricher calls the MCP tool `plan_data_load(query)` on the local MCP server (`city_data_server.py`). This tool parses the natural-language query with deterministic heuristics to figure out exactly what to fetch:
-
-```
-"hottest day last summer in Chicago"
-    → needs_load: true
-    → location: Chicago
-    → start_date: 2024-06-21
-    → end_date:   2024-09-22
-```
-
-**Step 2 — Check coverage**
-
-The enricher calls `check_coverage(location, start_date, end_date)` — another MCP tool that queries the SQLite database to see if that date range is already loaded. If it is, the load is skipped entirely.
-
-**Step 3 — Fetch data**
-
-If coverage is missing, the enricher calls `load_weather(location, start_date, end_date)`, which hits the [Open-Meteo API](https://open-meteo.com) (free, no key required) and writes the rows directly into the `weather_daily` table in `cityops.sqlite`.
-
-The enricher returns lightweight metadata to the agent — just the table name and row count — never the raw rows.
-
----
-
-### 3. Schema
-
-After enrichment, a schema node rebuilds a fresh snapshot of the database:
-
-```
-=== DATABASE SCHEMA ===
-  weather_daily: location, date, temp_max, temp_min, precip_mm, wind_mph
-======================
-```
-
-This snapshot is injected into the actor's context on every attempt, so the LLM always sees the real column names after a data load.
-
----
-
-### 4. Actor
-
-The actor is the second LLM call. It receives:
-- The schema snapshot
-- Sample rows from the relevant tables (so it sees actual location strings and date formats)
-- The plan from the planner
-- An explicit **intent hint** derived from the query (`INTENT: find a single extreme-value day. Use ORDER BY ... LIMIT 1.`)
-- A **location pin** (`LOADED LOCATION: 'Chicago' — you MUST use WHERE location = 'Chicago'`)
-- Any previous failed attempts and error messages (on retry)
-
-The actor outputs raw SQL, which is immediately executed against the local SQLite database. Results are stored in state and passed to the judge.
-
-The intent hint system is a guardrail specifically for small models — it forces the model toward the correct SQL pattern (aggregation vs. point lookup vs. overview) before it generates a single token of SQL.
-
----
-
-### 5. Judge
-
-The judge evaluates whether the SQL result correctly answers the user's question. It runs two checks in order:
-
-**Programmatic check (no LLM)**
-
-First, deterministic rules catch clear failures without spending an LLM call:
-- SQL syntax error → fail with the exact error message
-- Zero rows returned → fail with a hint about filter logic
-
-**Semantic check (LLM)**
-
-If the query ran and returned rows, a lightweight LLM call asks: *does this result actually answer the question?* It can only fail for:
-- `wrong_aggregation` — used AVG when MIN/MAX was needed
-- `missing_filter` — a required filter is absent
-- `wrong_table` — queried the wrong table entirely
-
-The judge is deliberately conservative: if the data answers the question, it passes — even if the numbers look surprising. It never fails based on world knowledge.
-
-**Confidence threshold**
-
-A result must pass AND have confidence ≥ 0.85 to be accepted. Below that, the judge treats it as a retry.
-
----
-
-### 6. Judge → MCP Reload (Recovery Path)
-
-If the SQL returns zero rows on the **second attempt**, the judge checks whether the generated SQL was filtering on a date range that isn't in the database. It extracts dates from the SQL via regex and calls `check_coverage` via MCP:
-
-```
-SQL:  WHERE location = 'Chicago' AND date >= '2024-06-01' AND date <= '2024-06-30'
-      ↓
-check_coverage(location='Chicago', start_date='2024-06-01', end_date='2024-06-30')
-      ↓ not covered
-      ↓
-inject tool_calls into plan → route back to ENRICHER → reload → retry ACTOR
-```
-
-This recovery path handles the case where the actor wrote a date-filtered query for a range that the enricher hadn't loaded yet. The agent reloads the exact missing range from Open-Meteo and retries — without involving the LLM planner again.
-
-The loop runs up to **5 iterations** before the agent gives up and returns an honest "no data" response.
-
----
-
-### 7. Final Answer
-
-The synthesizer (a third LLM call) converts the raw SQL result rows into a concise plain-English answer. It is strictly grounded — it copies numbers and dates exactly from the data and never invents or estimates values.
+**Final Answer** — Converts result rows into a plain-English answer grounded strictly in the returned data.
 
 ---
 

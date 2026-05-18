@@ -10,6 +10,8 @@ import sys
 from datetime import date
 from pathlib import Path
 
+from mcp_client import metrics
+
 DB_PATH = Path(__file__).parent / "cityops.sqlite"
 
 
@@ -50,8 +52,9 @@ def clear_weather_data() -> None:
 
 def check_ollama() -> None:
     try:
+        import os
         import ollama
-        ollama.list()
+        ollama.Client(host=os.getenv("OLLAMA_HOST", "http://localhost:11434")).list()
     except Exception:
         print("ERROR: Cannot reach Ollama. Is it running?")
         print("  Start it with:  ollama serve")
@@ -95,8 +98,14 @@ def main() -> None:
             break
 
         try:
+            metrics.begin_query()
             result = agent.run(query)
             print_answer(result)
+            metrics.end_query(
+                iterations=result.get("iteration", 0),
+                success=result.get("status") == "pass",
+            )
+            print(metrics.report())
         except Exception as e:
             print(f"\nERROR: {e}\n")
 

@@ -5,10 +5,10 @@ from langgraph.graph import StateGraph, END
 
 from database import (
     list_tables, get_schema, get_col_names, sample_rows, query_database,
-    check_date_range, find_join_path, build_schema_reference,
+    check_date_range, find_join_path,
 )
 from llm_helper import llm, extract_sql, MODEL
-from mcp_client import call_tool as mcp_call
+from mcp_client import call_tool as mcp_call, read_resource, get_prompt, list_prompts
 
 MAX_ITER       = 5
 CONF_THRESHOLD = 0.85
@@ -48,6 +48,8 @@ class AgentState(TypedDict):
     original_query  : str
     plan            : Optional[dict]
     schema_snapshot : Optional[str]
+    prompt_scaffold : Optional[str]
+    loaded_location : Optional[str]   # city confirmed loaded by enricher
     sql_attempts    : List[str]
     query_results   : List[dict]
     judge_verdicts  : List[dict]
@@ -101,16 +103,21 @@ def enricher_node(state: AgentState) -> AgentState:
     if explicit_calls:
         tc     = explicit_calls[0]
         result = mcp_call(tc["tool_name"], tc["args"])
+        location = result.get("location") or tc["args"].get("location")
     else:
         load_plan = mcp_call("plan_data_load", {"query": state["original_query"]})
         if not load_plan.get("needs_load"):
             print("[ENRICHER] no data load needed")
             return state
-        coverage = mcp_call("check_coverage", load_plan["args"])
+        load_args     = load_plan["args"]
+        coverage_args = {k: v for k, v in load_args.items()
+                         if k in ("location", "start_date", "end_date")}
+        coverage = mcp_call("check_coverage", coverage_args)
         if coverage.get("covered"):
             print("[ENRICHER] data already in DB — skipping")
-            return state
-        result = mcp_call("load_weather", load_plan["args"])
+            return {**state, "loaded_location": load_args.get("location")}
+        result   = mcp_call("load_weather", load_args)
+        location = result.get("location") or load_args.get("location")
 
     if "error" in result:
         print(f"[ENRICHER] MCP error: {result['error']}")
@@ -120,31 +127,57 @@ def enricher_node(state: AgentState) -> AgentState:
         table   = result["table_name"]
         updated = {**state["plan"], "tables": list(set(state["plan"].get("tables", []) + [table]))}
         print(f"[ENRICHER] table '{table}' ({result['row_count']} rows) ready")
-        return {**state, "plan": updated}
+        return {**state, "plan": updated, "loaded_location": location}
 
     print(f"[ENRICHER] {result}")
     return state
 
 
-# ── Schema ────────────────────────────────────────────────────────────────────
+# ── Schema + Prompt ───────────────────────────────────────────────────────────
+
+# Maps query intent to an MCP Prompt name (server-managed SQL templates).
+# This replaces the hardcoded _EXTREME_TRIGGERS / _SPECIFIC_TRIGGERS / _OVERVIEW_TRIGGERS.
+def _classify_intent(query: str) -> str:
+    q = query.lower()
+    if any(t in q for t in {"hottest", "coldest", "warmest", "coolest", "highest",
+                              "lowest", "maximum", "minimum", "max", "min", "windiest", "wettest"}):
+        return "extreme_value_query"
+    # Point-in-time takes priority — "forecast high tomorrow" is specific_date, not trend_overview
+    if any(t in q for t in {"tomorrow", "today", "yesterday", "will it", "on "}):
+        return "specific_date_query"
+    # Multi-day windows and general forecasts
+    if any(t in q for t in {"this week", "next week", "this month", "week", "forecast"}):
+        return "trend_overview_query"
+    if any(t in q for t in {"compare", "which city", "cities", "vs", "versus"}):
+        return "comparison_query"
+    if any(t in q for t in {"average", "avg", "total", "count", "how many days"}):
+        return "aggregation_query"
+    return "trend_overview_query"
+
 
 def schema_node(state: AgentState) -> AgentState:
-    """Rebuild schema reference from the live DB after any MCP enrichment."""
-    schema = build_schema_reference()
+    """Fetch schema Resource + matching MCP Prompt scaffold after any enrichment."""
+    import re as _re
+    schema = read_resource("weather://schema")
     tables = list_tables()["tables"]
+
+    # Parse live column names from the schema snapshot
+    col_match = _re.search(r"weather_daily:\s*(.+)", schema)
+    columns   = col_match.group(1).strip() if col_match else "location, date, temp_max, temp_min, precip_mm, wind_mph"
+
+    # Classify intent and fetch the matching server-managed SQL scaffold
+    intent   = _classify_intent(state["original_query"])
+    scaffold = get_prompt(intent, {"location": "the city", "columns": columns})
+
     print(f"\n{'━' * W}")
-    print(f" SCHEMA  ›  refreshed")
+    print(f" SCHEMA  ›  MCP Resource  +  Prompt [{intent}]")
     print(f"{'━' * W}")
-    print(f"[SCHEMA] tables now available: {tables}")
-    return {**state, "schema_snapshot": schema}
+    print(f"[SCHEMA] tables: {tables}")
+
+    return {**state, "schema_snapshot": schema, "prompt_scaffold": scaffold}
 
 
 # ── Actor ─────────────────────────────────────────────────────────────────────
-_OVERVIEW_TRIGGERS = {"like", "was it", "how was", "describe", "overview", "summary",
-                      "tell me about", "what was", "average", "avg", "overall"}
-_EXTREME_TRIGGERS  = {"hottest", "coldest", "warmest", "coolest", "highest", "lowest",
-                      "maximum", "minimum", "max", "min", "windiest", "wettest"}
-_SPECIFIC_TRIGGERS = {"tomorrow", "today", "yesterday", "on ", "will it"}
 
 ACTOR_SYS = """You are a senior SQL engineer. Write one correct SQLite query.
 Rules:
@@ -153,13 +186,16 @@ Rules:
 - weather_daily columns: location (TEXT), date (TEXT), temp_max (REAL), temp_min (REAL), precip_mm (REAL), wind_mph (REAL)
 - Query weather directly: WHERE location = '<city>' — no join with other tables needed
 - The loaded location is visible in the sample rows above — use that exact string in WHERE location = '...'
-- CRITICAL — NO DATE FILTERS ON RANGE QUERIES:
-  weather_daily is pre-loaded for exactly the period the user asked about.
-  For ANY aggregation query (extreme temp, average, rainy days over a period):
-    use ONLY WHERE location = '<location from sample>' — no date filter at all.
+- CRITICAL — DATE FILTERS ON RANGE QUERIES:
+  For historical period queries ("last summer", "August 2024", "last month"):
+    weather_daily is pre-loaded for exactly that period.
+    Use ONLY WHERE location = '<loc>' — DO NOT add date filters, the data is already scoped.
+  For explicit time-window queries ("this week", "next week", "this month"):
+    A DATE FILTER REQUIRED line will appear above — you MUST copy that exact filter into your SQL.
 
-  CORRECT:   SELECT location, date, temp_max FROM weather_daily WHERE location = '<loc>' ORDER BY CAST(temp_max AS REAL) DESC LIMIT 1
-  WRONG:     SELECT ... WHERE location = '<loc>' AND date >= '2025-06-01' AND date <= '2025-09-22' ...
+  CORRECT (historical):   SELECT location, date, temp_max FROM weather_daily WHERE location = '<loc>' ORDER BY CAST(temp_max AS REAL) DESC LIMIT 1
+  CORRECT (this week):    SELECT ... FROM weather_daily WHERE location = '<loc>' AND date BETWEEN date('now') AND date('now', '+6 days')
+  WRONG:                  SELECT ... WHERE location = '<loc>' AND date >= '2025-06-01' AND date <= '2025-09-22' ...
 
   For specific-point queries only (today/tomorrow/yesterday/a named date), add an exact date:
     tomorrow → WHERE location = '<loc>' AND date = date('now', '+1 day')
@@ -182,16 +218,21 @@ def actor_node(state: AgentState) -> AgentState:
     _hdr(f"ACTOR  attempt {itr + 1}/{MAX_ITER}")
 
     ctx = []
-    loaded_location = None  # extracted from sample rows; used to lock the WHERE clause
+    # Location is set by enricher_node from the actual load result — never inferred from sample rows.
+    # This prevents the actor from defaulting to whichever city happens to appear first in the DB.
+    loaded_location = state.get("loaded_location")
     for tbl in tables:
         schema = get_schema(tbl)
         sample = sample_rows(tbl)
+        # Filter sample rows to the confirmed city so the actor sees the right location examples
+        if tbl == "weather_daily" and loaded_location and sample.get("rows"):
+            city_rows = [r for r in sample["rows"] if r.get("location") == loaded_location]
+            if city_rows:
+                sample = {**sample, "rows": city_rows}
         ctx.append(f"--- {tbl} schema ---\n{json.dumps(schema, indent=2)}")
         ctx.append(f"--- {tbl} sample ---\n{json.dumps(sample, indent=2)}")
         if tbl == "weather_daily":
             dr = check_date_range("weather_daily", "date")
-            if sample.get("rows"):
-                loaded_location = sample["rows"][0].get("location")
             ctx.append(
                 f"--- weather_daily loaded range ---\n"
                 f"min_date={dr.get('min')}  max_date={dr.get('max')}  rows={dr.get('row_count')}"
@@ -231,39 +272,45 @@ def actor_node(state: AgentState) -> AgentState:
         if tool_result:
             retry_block += f"\n=== DEBUG TOOL: {tool} ===\n{json.dumps(tool_result, indent=2)}\n"
 
-    schema_ref = state.get("schema_snapshot") or build_schema_reference()
+    schema_ref = state.get("schema_snapshot") or ""
+    scaffold   = state.get("prompt_scaffold") or ""
+
     # Strip strategy from what the actor sees — it contains the planner's SQL guess
     # which has wrong date ranges and column names that bleed into the generated SQL.
     actor_plan = {k: v for k, v in state["plan"].items()
                   if k not in ("strategy", "caveats")}
     actor_plan["tables"] = tables
 
-    # Detect query intent and inject an explicit hint so the 3B model picks the right pattern
-    _q = state["original_query"].lower()
-    if any(t in _q for t in _EXTREME_TRIGGERS):
-        intent_hint = "INTENT: find a single extreme-value day. Use ORDER BY ... LIMIT 1."
-    elif any(t in _q for t in _SPECIFIC_TRIGGERS):
-        intent_hint = "INTENT: look up a specific date. Filter by exact date = date('now', ...) or date = 'YYYY-MM-DD'."
-    elif any(t in _q for t in _OVERVIEW_TRIGGERS):
-        intent_hint = "INTENT: summarise a whole period. Use the OVERVIEW aggregation SQL (AVG, MAX, MIN, COUNT rainy days) — do NOT use LIMIT 1."
-    else:
-        intent_hint = ""
-
     # Pin the location at the top of the prompt so the LLM can't confuse it with another city.
-    # The 3B model reliably ignores buried "use the sample rows" instructions.
     loc_line = (
         f"LOADED LOCATION: '{loaded_location}' — you MUST use WHERE location = '{loaded_location}' in your SQL.\n\n"
         if loaded_location else ""
     )
 
+    # For explicit time-window queries, pin the exact SQLite date expression so the model
+    # can't omit the filter. Small models ignore vague retry hints like "add a date filter".
+    _q = state["original_query"].lower()
+    if "next week" in _q:
+        date_hint_line = "DATE FILTER REQUIRED — include in your WHERE clause: AND date BETWEEN date('now', '+7 days') AND date('now', '+13 days')\n\n"
+    elif any(t in _q for t in ("this week", "this forecast", "forecast this week")):
+        date_hint_line = "DATE FILTER REQUIRED — include in your WHERE clause: AND date BETWEEN date('now') AND date('now', '+6 days')\n\n"
+    elif "this month" in _q:
+        date_hint_line = "DATE FILTER REQUIRED — include in your WHERE clause: AND date BETWEEN date('now', 'start of month') AND date('now', 'start of month', '+1 month', '-1 day')\n\n"
+    else:
+        date_hint_line = ""
+
+    # Inject the MCP Prompt scaffold (server-managed SQL template for this intent type)
+    scaffold_block = f"\n=== SQL PATTERN (from MCP Prompt) ===\n{scaffold}\n======================================\n" if scaffold else ""
+
     user_prompt = (
         loc_line
+        + date_hint_line
         + schema_ref + "\n\n"
-        f"Original question: {state['original_query']}\n"
-        + (f"[{intent_hint}]\n" if intent_hint else "")
+        + scaffold_block
+        + f"Original question: {state['original_query']}\n"
         + f"Plan:\n{json.dumps(actor_plan, indent=2)}\n\n"
-        f"Table details (schema + sample rows):\n" + "\n".join(ctx) + retry_block +
-        "\n\nWrite the SQL query now:"
+        + f"Table details (schema + sample rows):\n" + "\n".join(ctx) + retry_block
+        + "\n\nWrite the SQL query now:"
     )
     raw = llm(ACTOR_SYS, user_prompt)
     sql = extract_sql(raw)
@@ -286,27 +333,27 @@ def actor_node(state: AgentState) -> AgentState:
 
 # Only called when SQL ran successfully and returned rows — purely semantic check.
 JUDGE_SYS = """You are a SQL result reviewer. The query ran successfully and returned rows.
-Decide ONLY whether the result correctly answers the user's question.
+Your job: does the RESULT DATA answer the user's question?
 
-Pass criteria — ALL must be true:
-- The question is answered (e.g. "coldest day" → result includes date and temperature)
-- No obviously wrong table or aggregation
+Evaluate the result, not the SQL. Ignore how the SQL was written — focus on what the data shows.
 
-Fail criteria — use ONE of these, or pass:
-- wrong_aggregation: clearly wrong function (AVG when MIN/MAX needed)
-- missing_filter: filter the question explicitly requires is absent
+PASS if the result columns contain data that addresses the question for the right city.
+FAIL (pick one) only for clear-cut semantic errors:
+- wrong_aggregation: result uses the wrong aggregate (e.g. one average row when "which day was hottest" needs a single extreme-value row with a date)
+- missing_filter: result data is for the WRONG entity (e.g. shows Atlanta rows when the question is about Chicago)
 - wrong_table: queried the wrong table entirely
 
-CRITICAL — Trust the data, not world knowledge:
-- If the forecast data says the coldest day is 87°F → that IS the correct answer for a May forecast. PASS.
-- Do NOT use implausible_result based on what temperatures "should" be. The data may be a short forecast.
-- Do NOT fail because you think more filters could be added. If the data answers the question, PASS.
+CRITICAL:
+- Evaluate the result rows and columns — NOT whether the SQL has a specific WHERE clause
+- If the result contains relevant columns (rainy_days, precip_mm, temp_max, dates) that address the question → PASS
+- wrong_aggregation only fires when the aggregation type is clearly wrong for the question shape (extreme vs. average)
+- missing_filter only fires when the result is for the WRONG scope — not because a WHERE clause is absent
+- Unusual values (87°F coldest day, 5 rainy days out of 7) → PASS, trust the data
 
 Respond ONLY with valid JSON — no prose, no markdown.
-JSON schema:
 {
   "status":        "pass" or "fail",
-  "error_class":   "none|wrong_aggregation|missing_filter|wrong_table|implausible_result",
+  "error_class":   "none|wrong_aggregation|missing_filter|wrong_table",
   "error_msg":     "specific issue or 'none'",
   "strategy_hint": "one-sentence fix for the actor, or 'none'",
   "confidence":    0.95
@@ -494,6 +541,8 @@ def run(query: str) -> dict:
         original_query=query,
         plan=None,
         schema_snapshot=None,
+        prompt_scaffold=None,
+        loaded_location=None,
         sql_attempts=[],
         query_results=[],
         judge_verdicts=[],

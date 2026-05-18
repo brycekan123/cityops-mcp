@@ -11,13 +11,19 @@ Run in dev mode:  fastmcp dev city_data_server.py
 
 import calendar
 import csv
+import logging
 import re
 import sqlite3
 from datetime import date, timedelta
 from pathlib import Path
 
 from fastmcp import FastMCP
+from fastmcp.server.middleware.error_handling import ErrorHandlingMiddleware
+from fastmcp.server.middleware.timing import TimingMiddleware
 from data_sources import fetch_weather
+
+logging.basicConfig(level=logging.WARNING)
+_logger = logging.getLogger("weather_mcp")
 
 PROJECT_DIR = Path(__file__).parent
 DB_PATH     = PROJECT_DIR / "cityops.sqlite"
@@ -53,7 +59,13 @@ def _extract_city(query: str) -> str:
     return "Atlanta"
 
 
-mcp = FastMCP("Weather Data Server")
+mcp = FastMCP(
+    "Weather Data Server",
+    middleware=[
+        ErrorHandlingMiddleware(logger=_logger, include_traceback=False),
+        TimingMiddleware(logger=_logger, log_level=logging.DEBUG),
+    ],
+)
 
 
 # ── DB helpers ────────────────────────────────────────────────────────────────
@@ -95,6 +107,42 @@ def _insert_rows(conn, table_name: str, rows: list[dict], source: str,
     )
     conn.commit()
     return columns
+
+
+# ── Resources ─────────────────────────────────────────────────────────────────
+
+@mcp.resource("weather://schema")
+def schema_resource() -> str:
+    """Current database schema — all tables and their columns."""
+    with _conn() as conn:
+        tables = [r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND name NOT IN ('source_loads')"
+        ).fetchall()]
+        lines = ["=== DATABASE SCHEMA ==="]
+        for tbl in tables:
+            cols = conn.execute(f"PRAGMA table_info('{tbl}')").fetchall()
+            col_parts = [c[1] + ("(PK)" if c[5] else "") for c in cols]
+            lines.append(f"  {tbl}: {', '.join(col_parts)}")
+        lines.append("======================")
+        return "\n".join(lines)
+
+
+@mcp.resource("weather://tables")
+def tables_resource() -> str:
+    """Currently loaded tables with row counts."""
+    with _conn() as conn:
+        tables = [r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND name NOT IN ('source_loads')"
+        ).fetchall()]
+        if not tables:
+            return "No tables loaded."
+        lines = []
+        for tbl in tables:
+            count = conn.execute(f'SELECT COUNT(*) FROM "{tbl}"').fetchone()[0]
+            lines.append(f"  {tbl}: {count} rows")
+        return "\n".join(lines)
 
 
 # ── Tools ─────────────────────────────────────────────────────────────────────
@@ -321,6 +369,94 @@ def load_csv(filename: str) -> dict:
         cols = _insert_rows(conn, table_name, rows, "local_csv", f"file={filename}")
 
     return {"table_name": table_name, "row_count": len(rows), "columns": cols}
+
+
+# ── Prompts ───────────────────────────────────────────────────────────────────
+
+@mcp.prompt()
+def extreme_value_query(location: str, columns: str) -> str:
+    """SQL scaffold for finding a single extreme-value record (hottest/coldest/windiest/wettest day)."""
+    return (
+        f"Find the single extreme-value record for {location}.\n"
+        f"Available columns: {columns}\n"
+        f"Pattern: SELECT location, date, <relevant_col> FROM weather_daily\n"
+        f"  WHERE location = '{location}'\n"
+        f"  ORDER BY CAST(<relevant_col> AS REAL) DESC LIMIT 1\n"
+        f"Choose DESC for hottest/windiest/wettest, ASC for coldest."
+    )
+
+
+@mcp.prompt()
+def trend_overview_query(location: str, columns: str) -> str:
+    """SQL scaffold for summarising a period (overview/forecast/what was it like)."""
+    return (
+        f"Summarise weather for a period in {location}.\n"
+        f"Available columns: {columns}\n"
+        f"ALWAYS add a date filter that matches the question's time window:\n"
+        f"  'this week' / 'this forecast':  AND date BETWEEN date('now') AND date('now', '+6 days')\n"
+        f"  'next week':                    AND date BETWEEN date('now', '+7 days') AND date('now', '+13 days')\n"
+        f"  named past period (e.g. 'last summer', 'last month'): AND date BETWEEN 'YYYY-MM-DD' AND 'YYYY-MM-DD'\n"
+        f"  no period specified:            omit the date filter\n"
+        f"Pattern: SELECT\n"
+        f"  ROUND(AVG(CAST(temp_max AS REAL)),1) AS avg_high_f,\n"
+        f"  ROUND(AVG(CAST(temp_min AS REAL)),1) AS avg_low_f,\n"
+        f"  ROUND(MAX(CAST(temp_max AS REAL)),1) AS hottest_f,\n"
+        f"  ROUND(MIN(CAST(temp_min AS REAL)),1) AS coldest_f,\n"
+        f"  SUM(CASE WHEN CAST(precip_mm AS REAL) > 0 THEN 1 ELSE 0 END) AS rainy_days,\n"
+        f"  COUNT(*) AS total_days\n"
+        f"FROM weather_daily WHERE location = '{location}'\n"
+        f"  [AND date BETWEEN ... AND ...   -- always filter to the relevant window]\n"
+        f"No LIMIT — aggregate the filtered rows."
+    )
+
+
+@mcp.prompt()
+def specific_date_query(location: str, columns: str) -> str:
+    """SQL scaffold for a point-in-time lookup (today/tomorrow/yesterday/named date)."""
+    return (
+        f"Look up weather on a specific date for {location}.\n"
+        f"Available columns: {columns}\n"
+        f"Pattern: SELECT location, date, temp_max, temp_min, precip_mm, wind_mph\n"
+        f"  FROM weather_daily\n"
+        f"  WHERE location = '{location}'\n"
+        f"    AND date = date('now')            -- today\n"
+        f"    AND date = date('now', '+1 day')  -- tomorrow\n"
+        f"    AND date = 'YYYY-MM-DD'           -- named date\n"
+        f"Use exactly one date filter. No LIMIT needed."
+    )
+
+
+@mcp.prompt()
+def comparison_query(location: str, columns: str) -> str:
+    """SQL scaffold for comparing multiple cities side by side."""
+    return (
+        f"Compare weather across cities (starting from {location}).\n"
+        f"Available columns: {columns}\n"
+        f"Pattern: SELECT location,\n"
+        f"  ROUND(AVG(CAST(temp_max AS REAL)),1) AS avg_high_f,\n"
+        f"  ROUND(MAX(CAST(temp_max AS REAL)),1) AS hottest_f,\n"
+        f"  SUM(CASE WHEN CAST(precip_mm AS REAL) > 0 THEN 1 ELSE 0 END) AS rainy_days\n"
+        f"FROM weather_daily\n"
+        f"GROUP BY location\n"
+        f"ORDER BY avg_high_f DESC\n"
+        f"No WHERE location filter — GROUP BY replaces it when comparing cities."
+    )
+
+
+@mcp.prompt()
+def aggregation_query(location: str, columns: str) -> str:
+    """SQL scaffold for aggregate questions (average/total/how many days/count)."""
+    return (
+        f"Compute an aggregate statistic for {location}.\n"
+        f"Available columns: {columns}\n"
+        f"Pattern: SELECT\n"
+        f"  COUNT(*) AS total_days,\n"
+        f"  SUM(CASE WHEN CAST(precip_mm AS REAL) > 0 THEN 1 ELSE 0 END) AS rainy_days,\n"
+        f"  ROUND(AVG(CAST(temp_max AS REAL)),1) AS avg_high_f\n"
+        f"FROM weather_daily\n"
+        f"WHERE location = '{location}'\n"
+        f"Adjust the SELECT columns and aggregation function to match the specific question."
+    )
 
 
 if __name__ == "__main__":
