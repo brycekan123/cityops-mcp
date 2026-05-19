@@ -4,6 +4,13 @@ __pycache__/
 cityops.sqlite
 .DS_Store
 .claude/
-*.md
-benchmark.py
+.github/
 docs/
+tests/
+benchmark.py
+SESSION_SUMMARY.md
+.pytest_cache/
+.ruff_cache/
+dist/
+build/
+*.egg-info/

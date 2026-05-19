@@ -1,8 +1,9 @@
 """
 Sync MCP client wrapper.
 
-Connects to city_data_server.py via stdio (spawned once as a subprocess).
-All public functions are synchronous so LangGraph nodes can call them directly.
+Connects to the cityops_mcp package via stdio (spawned once as a subprocess via
+`python -m cityops_mcp`). All public functions are synchronous so LangGraph
+nodes can call them directly.
 
 Includes:
   - Client-side cache for pure tools (plan_data_load, check_coverage)
@@ -13,15 +14,21 @@ Includes:
 import asyncio
 import json
 import statistics
+import sys
 import threading
 import time
-from pathlib import Path
 from typing import Any
 
 from fastmcp import Client
-from fastmcp.client.transports import PythonStdioTransport
+from fastmcp.client.transports import StdioTransport
 
-SERVER_SCRIPT = Path(__file__).parent / "city_data_server.py"
+# Spawn the server using the same Python interpreter as the caller, via the
+# installed package's module entry point. Requires `pip install -e .` (or
+# equivalent) so `cityops_mcp` is importable.
+_SERVER_TRANSPORT = StdioTransport(
+    command=sys.executable,
+    args=["-m", "cityops_mcp"],
+)
 
 # ── Persistent MCP connection ─────────────────────────────────────────────────
 # One server subprocess, one event loop thread, alive for the whole session.
@@ -52,7 +59,7 @@ def _ensure_connection() -> None:
         async def _keep_alive():
             global _client
             try:
-                async with Client(PythonStdioTransport(script_path=SERVER_SCRIPT)) as c:
+                async with Client(_SERVER_TRANSPORT) as c:
                     _client = c
                     _ready.set()
                     # Hold the async-with context open for the session lifetime
@@ -67,9 +74,9 @@ def _ensure_connection() -> None:
 
         connected = _ready.wait(timeout=30)
         if connected and _client is not None:
-            print(f"[MCP] connected to {SERVER_SCRIPT.name} (persistent session)")
+            print("[MCP] connected to cityops_mcp (persistent session)")
         else:
-            print(f"[MCP] WARNING: connection timed out — falling back to per-call mode")
+            print("[MCP] WARNING: connection timed out — falling back to per-call mode")
 
 
 def _run(coro):
@@ -88,21 +95,13 @@ def _cache_key(tool_name: str, args: dict) -> str:
     return f"{tool_name}:{json.dumps(args, sort_keys=True)}"
 
 
-def _invalidate_cache(location: str | None = None) -> None:
+def _invalidate_cache(location: str) -> None:
     """
-    Selectively invalidate cache after DB state changes.
-      load_weather(location): clears only coverage/plan entries for that city.
-        Schema and prompts are preserved — both are independent of row data.
-      load_csv (location=None): clears schema + coverage but preserves prompts
-        (prompts are pure SQL templates, never depend on DB content).
+    Invalidate cache after load_weather changes DB state.
+    Clears coverage/plan entries for the loaded city; schema and prompts
+    are preserved (both independent of row data).
     """
     schema_key = "resource:weather://schema"
-    if location is None:
-        to_delete = [k for k in _tool_cache
-                     if not k.startswith("prompt:")]
-        for k in to_delete:
-            del _tool_cache[k]
-        return
     loc_lower = location.lower()
     to_delete = [
         k for k in _tool_cache
@@ -238,12 +237,6 @@ def _extract(result) -> dict:
 def _fmt(result: dict) -> str:
     if "error" in result:
         return f"ERROR: {result['error']}"
-    if "files" in result:
-        return str(result["files"])
-    if "preview_rows" in result:
-        cols = result.get("columns", [])
-        n    = len(result.get("preview_rows", []))
-        return f"{len(cols)} columns: {', '.join(cols)} | {n} preview rows shown"
     if "table_name" in result:
         dr = f" [{result['date_range']}]" if result.get("date_range") else ""
         return f"loaded {result['row_count']} rows → table '{result['table_name']}'{dr}"
@@ -251,17 +244,6 @@ def _fmt(result: dict) -> str:
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
-
-def list_mcp_tools() -> list[str]:
-    """Return available tool names from the MCP server."""
-    async def _call():
-        tools = await _client.list_tools()
-        return [t.name for t in tools]
-
-    names = _run(_call())
-    print(f"[MCP] list_tools → {names}")
-    return names
-
 
 def call_tool(tool_name: str, args: dict) -> dict:
     """
@@ -297,8 +279,6 @@ def call_tool(tool_name: str, args: dict) -> dict:
         _tool_cache[key] = result
     elif tool_name == "load_weather" and not is_error:
         _invalidate_cache(location=args.get("location", ""))
-    elif tool_name == "load_csv" and not is_error:
-        _invalidate_cache()  # full clear — new table means schema changed
 
     return result
 

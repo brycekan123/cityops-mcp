@@ -1,14 +1,15 @@
 import json
+import re
 from typing import TypedDict, List, Optional
 
 from langgraph.graph import StateGraph, END
 
-from database import (
+from cityops_mcp.database import (
     list_tables, get_schema, get_col_names, sample_rows, query_database,
     check_date_range, find_join_path,
 )
 from llm_helper import llm, extract_sql, MODEL
-from mcp_client import call_tool as mcp_call, read_resource, get_prompt, list_prompts
+from mcp_client import call_tool as mcp_call, read_resource, get_prompt
 
 MAX_ITER       = 5
 CONF_THRESHOLD = 0.85
@@ -135,8 +136,6 @@ def enricher_node(state: AgentState) -> AgentState:
 
 # ── Schema + Prompt ───────────────────────────────────────────────────────────
 
-# Maps query intent to an MCP Prompt name (server-managed SQL templates).
-# This replaces the hardcoded _EXTREME_TRIGGERS / _SPECIFIC_TRIGGERS / _OVERVIEW_TRIGGERS.
 def _classify_intent(query: str) -> str:
     q = query.lower()
     if any(t in q for t in {"hottest", "coldest", "warmest", "coolest", "highest",
@@ -157,12 +156,11 @@ def _classify_intent(query: str) -> str:
 
 def schema_node(state: AgentState) -> AgentState:
     """Fetch schema Resource + matching MCP Prompt scaffold after any enrichment."""
-    import re as _re
     schema = read_resource("weather://schema")
     tables = list_tables()["tables"]
 
     # Parse live column names from the schema snapshot
-    col_match = _re.search(r"weather_daily:\s*(.+)", schema)
+    col_match = re.search(r"weather_daily:\s*(.+)", schema)
     columns   = col_match.group(1).strip() if col_match else "location, date, temp_max, temp_min, precip_mm, wind_mph"
 
     # Classify intent and fetch the matching server-managed SQL scaffold
@@ -423,11 +421,10 @@ def judge_node(state: AgentState) -> AgentState:
     # Only attempt once (itr == 1 means second judge call = first retry).
     new_status = None
     if not passed and result["row_count"] == 0 and itr == 1:
-        import re as _re
-        dates_in_sql = _re.findall(r"'(\d{4}-\d{2}-\d{2})'", sql)
+        dates_in_sql = re.findall(r"'(\d{4}-\d{2}-\d{2})'", sql)
         if dates_in_sql:
             sd, ed  = min(dates_in_sql), max(dates_in_sql)
-            loc_hit = _re.search(r"location\s*=\s*'([^']+)'", sql, _re.IGNORECASE)
+            loc_hit = re.search(r"location\s*=\s*'([^']+)'", sql, re.IGNORECASE)
             loc     = loc_hit.group(1) if loc_hit else "Atlanta"
             reload_args = {"location": loc, "start_date": sd, "end_date": ed}
             coverage    = mcp_call("check_coverage", reload_args)

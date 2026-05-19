@@ -6,3 +6,10 @@ cityops.sqlite
 .claude/
 docs/
 SESSION_SUMMARY.md
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/

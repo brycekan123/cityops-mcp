@@ -1,141 +1,279 @@
-# Agentic SQL Chatbot
+# cityops-mcp
 
-A local weather chatbot powered by a multi-node LangGraph agent, Ollama, and an MCP data server. Ask natural-language questions about weather across 8 US cities — the agent fetches live data on demand, writes SQL, self-corrects on failure, and answers in plain English.
+[![CI](https://github.com/brycekan/cityops-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/brycekan/cityops-mcp/actions/workflows/ci.yml)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
+A Model Context Protocol (MCP) server that gives Claude (or any MCP client) live weather data for 8 US cities — forecast *and* historical, no API keys, no setup beyond pasting a config snippet.
 
 ```
 hottest day last summer in Chicago?
-coldest night in New York last January?
 will it rain in Miami tomorrow?
 what's the forecast for Atlanta this week?
-which days had rain last month in Seattle?
+coldest night in Seattle last January?
 ```
 
-**Supported cities:** Atlanta, Chicago, New York, Los Angeles, Houston, Seattle, Miami, Denver
+Supports: Atlanta, Chicago, New York, Los Angeles, Houston, Seattle, Miami, Denver.
+
+---
+
+## ⚡ Install in Claude Desktop in 30 seconds
+
+**1. Install `uv`** (if you don't already have it):
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+**2. Paste this into your Claude Desktop config:**
+
+- macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`
+- Windows: `%APPDATA%\Claude\claude_desktop_config.json`
+- Linux: `~/.config/Claude/claude_desktop_config.json`
+
+```json
+{
+  "mcpServers": {
+    "cityops": {
+      "command": "uvx",
+      "args": [
+        "--from", "git+https://github.com/brycekan/cityops-mcp",
+        "cityops-mcp"
+      ]
+    }
+  }
+}
+```
+
+**3. Quit and reopen Claude Desktop.** Ask it: *"hottest day in Atlanta last summer?"*
+
+That's the whole install. First launch takes 30–60s while `uv` clones, builds a venv, and installs deps. Subsequent launches are fast.
+
+---
+
+## Install in Claude Code in one command
+
+If you use [Claude Code](https://docs.anthropic.com/claude/docs/claude-code), the CLI handles registration directly — no JSON editing.
+
+```bash
+claude mcp add cityops -s user -- uvx --from git+https://github.com/brycekan/cityops-mcp cityops-mcp
+```
+
+Verify:
+
+```bash
+claude mcp list
+```
+
+You should see a line like `cityops: uvx --from git+https://… cityops-mcp - ✓ Connected`. Open a new Claude Code session and ask the same question.
+
+> **Heads up — one-line gotcha.** Paste the `claude mcp add` command as a single line. If your terminal soft-wraps it across two lines and you press return mid-command, only the part before the break registers — you'll end up with a truncated, broken entry (`uvx --from` and nothing else) that fails silently with `✗ Failed to connect`. If that happens, `claude mcp remove cityops -s user` and try again on one line.
+
+For local development against a checked-out copy, point `--from` at the directory instead of the git URL, and use the **absolute path** to `uvx` (Claude Code's MCP env doesn't inherit your shell's PATH):
+
+```bash
+claude mcp add cityops -s user -- $(which uvx) --from /absolute/path/to/cityops-mcp cityops-mcp
+```
+
+---
+
+## 🌐 Works with any MCP client
+
+cityops-mcp speaks the standard MCP protocol over stdio — the same wire format every MCP client supports. Pick yours:
+
+| Client | Status | How to install |
+|---|---|---|
+| **Claude Desktop** (macOS/Windows/Linux) | Verified ✓ | JSON config snippet — [see above](#-install-in-claude-desktop-in-30-seconds) |
+| **Claude Code** (CLI + Desktop) | Verified ✓ | `claude mcp add` — [see above](#install-in-claude-code-in-one-command) |
+| **MCP Inspector** (browser debug GUI) | Verified ✓ | `npx @modelcontextprotocol/inspector -- uvx --from git+https://github.com/brycekan/cityops-mcp cityops-mcp` |
+| **Cursor** | Same JSON format as Claude Desktop | Drop the snippet into Cursor's MCP settings |
+| **Continue** | Same JSON format as Claude Desktop | See [Continue's MCP docs](https://docs.continue.dev/customize/deep-dives/mcp) |
+| **Your own agent** | Verified ✓ | Use [FastMCP's Client](https://github.com/jlowin/fastmcp) or the [MCP Python SDK](https://github.com/modelcontextprotocol/python-sdk). `mcp_client.py` in this repo is a working example with session metrics. |
+
+The LLM behind the client is decoupled from the server — Claude, GPT-4, local Llama, whatever your client supports works the same way over the same protocol.
+
+---
+
+## 🧰 What it does
+
+When connected, your MCP client gains the following capabilities. The LLM decides when to call each one — you just ask questions in plain English.
+
+### Tools
+
+| Tool | Purpose |
+|---|---|
+| `plan_data_load` | Parses a natural-language query into Open-Meteo fetch parameters (city + date range) |
+| `check_coverage` | Reports whether the requested city/date range is already in the local DB |
+| `load_weather` | Fetches from Open-Meteo (forecast or archive) and stores rows in `weather_daily` |
+| `load_csv` | Loads an arbitrary CSV from the data directory into a new SQLite table |
+| `run_sql` | Executes a read-only SELECT/WITH query against the loaded tables and returns rows (capped at 1000). Pairs with the prompts. |
+| `get_loaded_tables` | Returns current tables + columns + row counts |
+| `list_sources` | Lists the configured public data sources |
+
+### Resources
+
+| URI | Content |
+|---|---|
+| `weather://schema` | Live database schema (tables + columns) |
+| `weather://tables` | Currently loaded tables with row counts |
+
+### Prompts (server-managed SQL scaffolds)
+
+| Name | When to use |
+|---|---|
+| `extreme_value_query` | Hottest/coldest/windiest/wettest single day |
+| `trend_overview_query` | Multi-day summary with date range guidance |
+| `specific_date_query` | Today / tomorrow / yesterday / a named date |
+| `comparison_query` | City vs city aggregates |
+| `aggregation_query` | Averages, totals, counts |
+
+### Coverage-aware caching
+
+Most weather questions about the same city/date range don't need a fresh Open-Meteo round-trip. The server exposes `check_coverage` so the LLM can ask *"is this already loaded?"* before calling `load_weather`. In practice:
+
+- **First query** in a session — *"hottest day in Atlanta last summer?"* → `plan_data_load` → `check_coverage` (returns `false`) → `load_weather` (fetches ~94 days) → `run_sql` to find the max.
+- **Second query** in the same session — *"coldest night in Atlanta last summer?"* → `plan_data_load` → `check_coverage` (returns **`true`**) → skips `load_weather` entirely → `run_sql` straight against the rows the first query already pulled.
+
+The cache is the local SQLite file (`cityops.sqlite` in your platform's user-data dir) — persistent across sessions, accumulating coverage as you ask different questions. No TTL; delete the file to start fresh.
 
 ---
 
 ## Architecture
 
-| File | Role |
-|---|---|
-| `chatbot.py` | CLI loop — input, agent call, answer + MCP metrics |
-| `agent.py` | LangGraph graph — planner → enricher → schema → actor → judge → answer |
-| `city_data_server.py` | MCP server — Tools, Resources, Prompts, Middleware |
-| `mcp_client.py` | Sync MCP client — persistent connection, caching, session metrics |
-| `database.py` | SQLite helpers — schema, sampling, querying |
-| `llm_helper.py` | Ollama wrapper |
-| `benchmark.py` | Automated MCP benchmark — cache impact, error demo, primitives discovery |
-| `data_sources.py` | Open-Meteo HTTP fetch logic |
+```
+                 ┌──────────────────────────────┐
+ Claude /        │       MCP client             │
+ Cursor /  ───►  │  (Claude Desktop, Cursor,    │
+ Continue        │   Continue, your own agent)  │
+                 └──────────────┬───────────────┘
+                                │ stdio (JSON-RPC)
+                                ▼
+                 ┌──────────────────────────────┐
+                 │      cityops-mcp server      │
+                 │  (FastMCP + middleware)      │
+                 ├──────────────────────────────┤
+                 │  Tools • Resources • Prompts │
+                 └─────────────┬────────────────┘
+                               │
+              ┌────────────────┴───────────────┐
+              ▼                                ▼
+     ┌────────────────┐              ┌──────────────────┐
+     │   Open-Meteo   │              │   cityops.sqlite │
+     │ (forecast +    │              │   (session DB)   │
+     │  archive APIs) │              │                  │
+     └────────────────┘              └──────────────────┘
+```
 
-### MCP Protocol
+The server speaks the standard Model Context Protocol over stdio. It runs as a child process of the MCP client — no ports, no auth, no hosted service.
 
-All three MCP primitives are implemented:
+---
 
-| Primitive | Implementation | Purpose |
+## Local development
+
+```bash
+git clone https://github.com/brycekan/cityops-mcp
+cd cityops-mcp
+uv sync --extra dev
+
+# Run the server directly (rare — usually you connect via a client)
+uv run cityops-mcp
+
+# Inspect the server in a browser GUI — the canonical MCP debugging tool
+npx @modelcontextprotocol/inspector -- uv run cityops-mcp
+
+# Run tests
+uv run pytest
+
+# Lint
+uv run ruff check src tests
+```
+
+### Environment variables
+
+| Variable | Default | Purpose |
 |---|---|---|
-| **Tools** | `plan_data_load`, `check_coverage`, `load_weather`, `load_csv` | Data fetching and routing |
-| **Resources** | `weather://schema`, `weather://tables` | Live DB schema and table inventory |
-| **Prompts** | `extreme_value_query`, `trend_overview_query`, `specific_date_query`, `comparison_query`, `aggregation_query` | Server-managed SQL scaffolds injected into the actor |
-
-The client adds:
-- **Persistent connection** — server subprocess spawns once per session (~750ms saved per subsequent call)
-- **Caching** — tools, resources, and prompts cached with location-scoped invalidation
-- **SessionMetrics** — p50/p95 latency, cache hit rate, time saved, error rate
-
-The server adds:
-- **Middleware** — `ErrorHandlingMiddleware` wraps every tool; exceptions return `{"error": "..."}` instead of crashing the enricher
+| `CITYOPS_DB_PATH` | Platform user data dir | Override the SQLite file location |
+| `CITYOPS_DATA_DIR` | `<user-data-dir>/csv` | Directory `load_csv` reads from |
+| `CITYOPS_LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR` |
 
 ---
 
-## Agentic Workflow
+## Troubleshooting
 
-```
-User query
-    │
-    ▼
-┌─────────┐
-│ PLANNER │  LLM parses intent and identifies which tables to query
-└────┬────┘
-     │
-     ▼
-┌──────────┐ ◄─────────────────────────────────────┐
-│ ENRICHER │  MCP: plan → coverage check → load     │ (reload: missing date range)
-└────┬─────┘                                        │
-     │                                              │
-     ▼                                              │
-┌────────┐                                          │
-│ SCHEMA │  MCP: weather://schema + SQL Prompt       │
-└───┬────┘                                          │
-    │                                               │
-    ▼                                               │
-┌───────┐ ◄──────────────────┐                     │
-│ ACTOR │  LLM writes SQL     │ (retry, up to 5x)  │
-└───┬───┘                    │                     │
-    │                        │                     │
-    ▼                        │                     │
-┌───────┐  fail (bad SQL) ───┘                     │
-│ JUDGE │  fail (missing data) ────────────────────┘
-└───┬───┘
-    │ pass
-    ▼
-┌──────────────┐
-│ FINAL ANSWER │  LLM synthesizes rows into plain English
-└──────────────┘
+### "Server not showing up in Claude Desktop"
+
+Most common cause: **`uvx` is not on Claude Desktop's PATH.** macOS Claude Desktop spawns subprocesses with a stripped environment, so `command: "uvx"` may fail silently even when `which uvx` works in your terminal.
+
+Fix: use the absolute path. In a terminal, run `which uvx` and put the full path into the config:
+
+```json
+"command": "/Users/<you>/.local/bin/uvx",
 ```
 
-**Planner** — Outputs a JSON plan: intent, tables, and strategy. Does not decide what data to load.
+### "First launch is taking forever"
 
-**Enricher** — Calls `plan_data_load` to parse the query, `check_coverage` to check if the date range is in SQLite, and `load_weather` only if data is missing.
+Expected — `uvx` is cloning the repo and building a venv on the first run. 30–60 seconds is normal. Subsequent launches use the cache.
 
-**Schema** — Reads the `weather://schema` Resource and fetches a matching Prompt scaffold (one of five SQL templates keyed by intent). Both are injected into the actor.
+### "Where are the server logs?"
 
-**Actor** — Receives schema, sample rows filtered to the loaded city, the plan, and any prior failed attempts. Outputs raw SQL, immediately executed.
+Claude Desktop writes per-server logs to:
 
-**Judge** — Deterministic checks first (syntax error, zero rows). If rows returned, a lightweight LLM call checks semantic correctness against the result data — not the SQL form. Routes back to the actor (up to 5 retries) or to the enricher if a required date range is missing from the DB.
+- macOS: `~/Library/Logs/Claude/mcp-server-cityops.log`
+- Windows: `%APPDATA%\Claude\logs\mcp-server-cityops.log`
+- Linux: `~/.config/Claude/logs/mcp-server-cityops.log`
 
-**Final Answer** — Converts result rows into a plain-English answer grounded strictly in the data.
+For more verbose output set `CITYOPS_LOG_LEVEL=DEBUG` in the config's `env` block.
 
----
+### "Got a JSON syntax error"
 
-## Running
+Validate the config file at [jsonlint.com](https://jsonlint.com). Common gotchas: missing commas between server entries, trailing commas, mismatched braces.
 
-**Prerequisites:** Python 3.10+, [Ollama](https://ollama.com) running locally with a model pulled (`ollama pull llama3.1`)
+### "Corporate firewall blocks GitHub clone"
+
+Fall back to a local install:
 
 ```bash
-pip install -r requirements.txt
-python chatbot.py
+git clone https://github.com/brycekan/cityops-mcp ~/cityops-mcp
+cd ~/cityops-mcp && uv sync
 ```
 
-Override the model: `OLLAMA_MODEL=llama3.2 python chatbot.py`
+Then change the config `command` to point at the local install:
+
+```json
+"command": "uv",
+"args": ["run", "--directory", "/Users/<you>/cityops-mcp", "cityops-mcp"]
+```
 
 ---
 
-## Running with Docker
+## What's NOT included
+
+This server is intentionally minimal:
+- No authentication — stdio transport runs locally as a child process; no network surface to secure.
+- No upstream API keys — Open-Meteo is free and keyless.
+- No HTTP transport — local stdio only. (Hosted/remote MCP is on the roadmap.)
+- No multi-server orchestration — this is one focused server. (Companion servers for air quality and astronomy are planned.)
+
+---
+
+## Bonus: the in-repo agent demo
+
+This repository also contains a single-agent LangGraph chatbot that uses `cityops-mcp` as its data layer — included for reference and as an example of how to build agents that consume MCP servers.
 
 ```bash
-docker compose up --build
-docker compose exec chatbot python chatbot.py
+uv sync --extra dev --extra agent
+ollama pull llama3.1   # the demo uses local Ollama
+uv run python chatbot.py
 ```
 
-Copy `.env.example` → `.env` to override `OLLAMA_MODEL` or `OLLAMA_HOST`. CSV files in `./data/` are mounted into the container for use with `load_csv`.
+See `agent.py` for the planner → enricher → schema → actor → judge graph, and `mcp_client.py` for a persistent-connection MCP client wrapper with session metrics.
 
 ---
 
-## Running the Benchmark
+## License
 
-```bash
-python benchmark.py
-```
+MIT — see [LICENSE](LICENSE).
 
-Clears the database, runs 5 questions about the same dataset, and shows progressive cache acceleration. Discovers all three MCP primitives and demos `ErrorHandlingMiddleware` catching a bad city name.
+## Acknowledgements
 
----
-
-## Data Sources
-
-| Source | API | Coverage |
-|---|---|---|
-| Open-Meteo Forecast | `api.open-meteo.com/v1/forecast` | Next 16 days |
-| Open-Meteo Archive | `archive-api.open-meteo.com/v1/archive` | 1940–yesterday |
-
-No API keys required. Data is fetched on demand and cached in `cityops.sqlite` for the session.
+Built on [FastMCP](https://github.com/jlowin/fastmcp), the official Anthropic Python SDK for MCP. Data from [Open-Meteo](https://open-meteo.com/) (free, no key required, generous rate limits).

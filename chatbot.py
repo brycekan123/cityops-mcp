@@ -7,12 +7,11 @@ Requires: Ollama running locally (ollama serve)
 
 import sqlite3
 import sys
-from datetime import date
-from pathlib import Path
 
+from cityops_mcp.paths import get_db_path
 from mcp_client import metrics
 
-DB_PATH = Path(__file__).parent / "cityops.sqlite"
+DB_PATH = get_db_path()
 
 
 BANNER = """

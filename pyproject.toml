@@ -1,0 +1,73 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "cityops-mcp"
+version = "0.1.0"
+description = "MCP server for city operational data — weather across 8 US cities via Open-Meteo. Free, no API keys."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+authors = [{ name = "Bryce Kan" }]
+keywords = ["mcp", "model-context-protocol", "weather", "claude", "llm-tools"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = [
+    "fastmcp>=3.0",
+    "requests>=2.31",
+    "platformdirs>=4.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.5",
+]
+# Extras for the in-repo agent demo at the repo root (not required for the MCP server).
+agent = [
+    "langgraph>=0.2",
+    "ollama>=0.3",
+]
+
+[project.urls]
+Repository = "https://github.com/brycekan/cityops-mcp"
+Issues = "https://github.com/brycekan/cityops-mcp/issues"
+
+[project.scripts]
+cityops-mcp = "cityops_mcp.server:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/cityops_mcp"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "src/cityops_mcp",
+    "tests",
+    "README.md",
+    "LICENSE",
+    "pyproject.toml",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+asyncio_mode = "auto"

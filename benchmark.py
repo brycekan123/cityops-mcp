@@ -10,24 +10,24 @@ Requires: Ollama running locally (ollama serve)
 import sqlite3
 import sys
 import time
-from pathlib import Path
 
+from cityops_mcp.paths import get_db_path
 from mcp_client import call_tool, read_resource, list_resources, list_prompts, get_prompt, metrics
-
-DB_PATH = Path(__file__).parent / "cityops.sqlite"
 
 
 def _reset_db() -> None:
     """Clear weather rows so the benchmark always starts from a true cold state."""
-    if not DB_PATH.exists():
+    db_path = get_db_path()
+    if not db_path.exists():
         return
     try:
-        conn = sqlite3.connect(str(DB_PATH))
+        conn = sqlite3.connect(str(db_path))
         n = conn.execute("DELETE FROM weather_daily").rowcount
         conn.commit()
         conn.close()
         print(f"[benchmark] cleared {n} weather rows — cold start guaranteed")
-    except Exception:
+    except sqlite3.OperationalError:
+        # weather_daily doesn't exist yet — nothing to clear, equally cold.
         pass
 
 SEPARATOR = "═" * 62
@@ -108,8 +108,8 @@ def run_error_demo() -> None:
     """
     Show ErrorHandlingMiddleware catching an unhandled error.
     load_weather with a city not in Open-Meteo's coordinate table
-    triggers an exception inside data_sources.py that the middleware wraps
-    into a structured {"error": "..."} dict instead of crashing the server.
+    triggers an exception inside the cityops_mcp server that the middleware
+    wraps into a structured {"error": "..."} dict instead of crashing.
     """
     banner("Error demo — ErrorHandlingMiddleware")
     print("  Calling load_weather with invalid city 'INVALID_CITY_XYZ'\n")
