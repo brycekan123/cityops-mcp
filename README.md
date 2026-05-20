@@ -45,56 +45,35 @@ First call takes ~30s while `uv` builds the package. After that, fast.
 
 ---
 
-## Install in Codex CLI
+## ⚡ Install in Codex CLI (one command)
 
-Codex CLI can use the same stdio MCP server command:
+On a clean laptop, this is the whole install. No `git clone` needed — `uvx` clones the repo, builds an isolated venv, and runs the server for you.
+
+**1. Install `uv`** (skip if you already have it):
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+**2. Register the server with Codex CLI:**
 
 ```bash
 codex mcp add cityops -- uvx --from git+https://github.com/brycekan123/cityops-mcp cityops-mcp
 ```
 
-Verify:
+**3. Verify:**
 
 ```bash
 codex mcp list
 ```
 
-Open a new Codex session and ask: *"Use cityops to answer: hottest day in Atlanta last summer?"*
+Look for `cityops: uvx --from git+https://… cityops-mcp - enabled`.
 
-To reinstall from scratch:
+**4. Open a new Codex session and ask:** *"Use cityops to answer: hottest day in Atlanta last summer?"*
 
-```bash
-codex mcp remove cityops
-codex mcp add cityops -- uvx --from git+https://github.com/brycekan123/cityops-mcp cityops-mcp
-```
+First call takes ~30s while `uvx` builds the package. After that, fast.
 
-First call may take ~30s while `uvx` clones the repo and builds the package.
-
----
-
-## Install in Claude Desktop
-
-Paste this into your config (`~/Library/Application Support/Claude/claude_desktop_config.json` on macOS; `%APPDATA%\Claude\claude_desktop_config.json` on Windows; `~/.config/Claude/claude_desktop_config.json` on Linux):
-
-```json
-{
-  "mcpServers": {
-    "cityops": {
-      "command": "uvx",
-      "args": [
-        "--from", "git+https://github.com/brycekan123/cityops-mcp",
-        "cityops-mcp"
-      ]
-    }
-  }
-}
-```
-
-Quit Claude Desktop completely (⌘Q), reopen, and ask the same question.
-
-> If Claude Desktop says it can't find the server, use the absolute path for `command` — Claude Desktop spawns subprocesses with a stripped PATH. Run `which uvx` and substitute the full path (e.g. `/Users/<you>/.local/bin/uvx`).
-
-The same JSON snippet works in any MCP-compatible client (Cursor, Continue, your own agent) — MCP is a standard protocol over stdio.
+> Paste the `codex mcp add` command on **one line**. Terminal soft-wraps break it and silently register a truncated entry. If that happens: `codex mcp remove cityops` and try again.
 
 ---
 
