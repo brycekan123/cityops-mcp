@@ -41,8 +41,8 @@ agent = [
 ]
 
 [project.urls]
-Repository = "https://github.com/brycekan/cityops-mcp"
-Issues = "https://github.com/brycekan/cityops-mcp/issues"
+Repository = "https://github.com/brycekan123/cityops-mcp"
+Issues = "https://github.com/brycekan123/cityops-mcp/issues"
 
 [project.scripts]
 cityops-mcp = "cityops_mcp.server:main"
