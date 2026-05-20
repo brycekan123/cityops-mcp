@@ -45,6 +45,33 @@ First call takes ~30s while `uv` builds the package. After that, fast.
 
 ---
 
+## Install in Codex CLI
+
+Codex CLI can use the same stdio MCP server command:
+
+```bash
+codex mcp add cityops -- uvx --from git+https://github.com/brycekan123/cityops-mcp cityops-mcp
+```
+
+Verify:
+
+```bash
+codex mcp list
+```
+
+Open a new Codex session and ask: *"Use cityops to answer: hottest day in Atlanta last summer?"*
+
+To reinstall from scratch:
+
+```bash
+codex mcp remove cityops
+codex mcp add cityops -- uvx --from git+https://github.com/brycekan123/cityops-mcp cityops-mcp
+```
+
+First call may take ~30s while `uvx` clones the repo and builds the package.
+
+---
+
 ## Install in Claude Desktop
 
 Paste this into your config (`~/Library/Application Support/Claude/claude_desktop_config.json` on macOS; `%APPDATA%\Claude\claude_desktop_config.json` on Windows; `~/.config/Claude/claude_desktop_config.json` on Linux):
